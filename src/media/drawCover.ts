@@ -20,7 +20,7 @@ export interface CoverScene {
 }
 
 const FONT_STACK =
-  '"Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", "Helvetica Neue", Arial, sans-serif';
+  '"Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", "Noto Sans CJK KR", "Noto Sans", "Helvetica Neue", Arial, sans-serif';
 
 const timeLabel = (seconds: number) => {
   const total = Math.max(0, Math.floor(seconds));
