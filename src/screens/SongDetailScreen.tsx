@@ -2,8 +2,9 @@ import React, { useEffect, useRef } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { colors, radius, safeTop, shadow, space, type } from '../theme';
-import { findCreator, findSong } from '../data/mock';
-import { modeForGenre, startSynth, SynthHandle, synthSupported } from '../audio/synth';
+import { findCreator } from '../data/mock';
+import { getAudioContext, resumeAudio } from '../audio/webaudio';
+import { createMrSource, MrSource } from '../audio/mr';
 import { useClock } from '../hooks/useClock';
 import { CoverArt } from '../components/CoverArt';
 import { MrWaveform } from '../components/AudioBars';
@@ -16,31 +17,60 @@ import { formatCount, formatTime } from '../utils/format';
 import { DEFAULT_SETTINGS } from '../types';
 
 export function SongDetailScreen({ songId }: { songId: string }) {
-  const song = findSong(songId);
+  const { back, navigate, favorites, toggleFavorite, showToast, setTake, getSong } = useStore();
+  const song = getSong(songId);
   const creator = findCreator(song.creatorId);
-  const { back, navigate, favorites, toggleFavorite, showToast, setTake } = useStore();
 
   const clock = useClock(song.durationSec);
-  const synthRef = useRef<SynthHandle | null>(null);
+  const mrRef = useRef<MrSource | null>(null);
+  const busRef = useRef<any>(null);
   const liked = favorites.includes(song.id);
+  const hasFile = Boolean(song.audioUrl);
 
   useEffect(() => {
-    if (clock.playing) {
-      if (!synthRef.current) synthRef.current = startSynth(modeForGenre(song.genre), song.bpm);
-    } else if (synthRef.current) {
-      synthRef.current.stop();
-      synthRef.current = null;
-    }
-    return () => undefined;
-  }, [clock.playing, song.genre, song.bpm]);
+    let cancelled = false;
+    const run = async () => {
+      if (!clock.playing) {
+        mrRef.current?.stop();
+        return;
+      }
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      await resumeAudio(ctx);
+      if (cancelled) return;
+      if (!mrRef.current) {
+        busRef.current = ctx.createGain();
+        busRef.current.gain.value = 0.9;
+        busRef.current.connect(ctx.destination);
+        mrRef.current = await createMrSource(song, ctx, busRef.current);
+      }
+      if (cancelled) return;
+      mrRef.current?.play(clock.posRef.current);
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [clock.playing, song]);
 
   useEffect(
     () => () => {
-      synthRef.current?.stop();
-      synthRef.current = null;
+      mrRef.current?.dispose();
+      mrRef.current = null;
+      try {
+        busRef.current?.disconnect();
+      } catch {
+        // ignore
+      }
+      busRef.current = null;
     },
     [],
   );
+
+  const seekMr = (value: number) => {
+    clock.seek(value);
+    if (clock.playing) mrRef.current?.play(value);
+  };
 
   const startCover = () => {
     clock.pause();
@@ -135,7 +165,9 @@ export function SongDetailScreen({ songId }: { songId: string }) {
             <View>
               <Text style={styles.cardTitle}>MR 미리 듣기</Text>
               <Text style={styles.cardCaption}>
-                {synthSupported() ? 'Web Audio 신스 데모 · 실제 앱은 MR 음원 재생' : '타이머 데모 · 오디오 미지원 환경'}
+                {hasFile
+                  ? '크리에이터가 업로드한 실제 MR 파일 재생'
+                  : 'Web Audio 신스 데모 · 업로드한 MR은 원음으로 재생돼요'}
               </Text>
             </View>
             <Badge label="미리듣기" tone="mint" dot />
@@ -168,13 +200,13 @@ export function SongDetailScreen({ songId }: { songId: string }) {
             max={song.durationSec}
             step={0.5}
             accent={colors.mint}
-            onChange={value => clock.seek(value)}
+            onChange={seekMr}
             trackHeight={4}
             thumbSize={14}
           />
           <View style={styles.previewFoot}>
             <Text style={styles.previewFootText}>구간 이동</Text>
-            <Pressable onPress={() => clock.seek(0)} hitSlop={8}>
+            <Pressable onPress={() => seekMr(0)} hitSlop={8}>
               <Text style={styles.resetText}>처음으로</Text>
             </Pressable>
           </View>
@@ -188,12 +220,15 @@ export function SongDetailScreen({ songId }: { songId: string }) {
           />
           <Card padded={false} style={{ overflow: 'hidden' }}>
             <View style={{ paddingVertical: space(2) }}>
+                {song.lyrics.length === 0 ? (
+                  <Text style={styles.lyricEmpty}>가사가 없어요 · MR만으로 진행되고 자막 없이 촬영됩니다</Text>
+                ) : null}
                 {song.lyrics.map((line, index) => {
                   const active = index === activeIndex;
                   return (
                     <Pressable
                       key={`${line.start}-${index}`}
-                      onPress={() => clock.seek(line.start)}
+                      onPress={() => seekMr(line.start)}
                       style={({ pressed }) => [
                         styles.lyricLine,
                         active && styles.lyricActive,
@@ -304,6 +339,7 @@ const styles = StyleSheet.create({
   previewFoot: { flexDirection: 'row', justifyContent: 'space-between', marginTop: -4 },
   previewFootText: { ...type.micro, color: colors.textFaint, fontWeight: '500' },
   resetText: { ...type.micro, color: colors.textDim, fontWeight: '600' },
+  lyricEmpty: { ...type.body, color: colors.textFaint, fontSize: 12, paddingHorizontal: space(4), paddingVertical: space(3) },
   lyricLine: {
     flexDirection: 'row',
     gap: 12,

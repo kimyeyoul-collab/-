@@ -9,10 +9,11 @@ import {
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { absoluteFill, colors, radius, safeTop, shadow, space, type } from '../theme';
-import { findSong } from '../data/mock';
 import { useClock, useCountdown } from '../hooks/useClock';
 import { useCameraStream } from '../hooks/useCameraStream';
-import { modeForGenre, startSynth, SynthHandle } from '../audio/synth';
+import { getAudioContext, resumeAudio } from '../audio/webaudio';
+import { createMrSource, MrSource, preloadMr } from '../audio/mr';
+import { startTakeRecording, TakeRecorder } from '../media/recorder';
 import { useStore } from '../store';
 import { DEFAULT_SETTINGS } from '../types';
 import { CloseIcon, MicIcon, PauseIcon, PlayIcon } from '../components/Icons';
@@ -22,8 +23,8 @@ import { formatTicks, formatTime, wrapPhrase } from '../utils/format';
 type Phase = 'idle' | 'recording' | 'paused';
 
 export function RecordingScreen({ songId }: { songId: string }) {
-  const song = findSong(songId);
-  const { back, navigate, setTake, showToast } = useStore();
+  const { back, navigate, setTake, showToast, getSong } = useStore();
+  const song = getSong(songId);
 
   const clock = useClock(song.durationSec);
   const { count, start: startCountdown, stop: stopCountdown } = useCountdown();
@@ -33,7 +34,10 @@ export function RecordingScreen({ songId }: { songId: string }) {
   const [phase, setPhase] = useState<Phase>('idle');
   const [box, setBox] = useState({ w: 0, h: 0 });
   const [level, setLevel] = useState(0.14);
-  const synthRef = useRef<SynthHandle | null>(null);
+  const recorderRef = useRef<TakeRecorder | null>(null);
+  const mrRef = useRef<MrSource | null>(null);
+  const mrBusRef = useRef<any>(null);
+  const finishingRef = useRef(false);
   const blink = useRef(new Animated.Value(1)).current;
 
   /* ---- viewport size: keep a true 9:16 frame inside the available area ---- */
@@ -46,6 +50,12 @@ export function RecordingScreen({ songId }: { songId: string }) {
     const { width, height } = event.nativeEvent.layout;
     setBox({ w: width, h: height });
   };
+
+  /* --------------------- preload the MR so start is instant ------------------ */
+  useEffect(() => {
+    const ctx = getAudioContext();
+    if (ctx) void preloadMr(song, ctx);
+  }, [song]);
 
   /* ------------------------------ blinking REC ----------------------------- */
   useEffect(() => {
@@ -80,41 +90,70 @@ export function RecordingScreen({ songId }: { songId: string }) {
 
   /* ------------------------------- MR audio -------------------------------- */
   const stopMr = useCallback(() => {
-    synthRef.current?.stop();
-    synthRef.current = null;
+    mrRef.current?.stop();
+    mrRef.current = null;
   }, []);
 
-  useEffect(() => {
-    if (phase === 'recording' && !synthRef.current) {
-      synthRef.current = startSynth(modeForGenre(song.genre), song.bpm);
-    }
-    if (phase === 'idle') stopMr();
-    return undefined;
-  }, [phase, song.genre, song.bpm, stopMr]);
-
   useEffect(() => () => stopMr(), [stopMr]);
+
+  useEffect(
+    () => () => {
+      recorderRef.current?.cancel();
+      recorderRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     if (clock.isFinished && phase === 'recording') {
       setPhase('paused');
       stopMr();
+      recorderRef.current?.pause();
       showToast('커버 구간이 끝났어요. 녹음을 완료해 주세요');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clock.isFinished]);
 
   /* -------------------------------- actions -------------------------------- */
-  const beginRecording = useCallback(() => {
-    clock.reset();
-    clock.play();
-    setPhase('recording');
-  }, [clock]);
+  const beginRecording = useCallback(
+    async (stream: any) => {
+      const ctx = getAudioContext();
+      await resumeAudio(ctx);
+      if (ctx) {
+        const bus = ctx.createGain();
+        bus.gain.value = 0.85;
+        bus.connect(ctx.destination);
+        mrBusRef.current = bus;
+        const mr = await createMrSource(song, ctx, bus);
+        mrRef.current = mr;
+        mr?.play(0);
+      }
+      if (stream) {
+        recorderRef.current = startTakeRecording(stream);
+      } else {
+        recorderRef.current = null;
+      }
+      clock.reset();
+      clock.play();
+      setPhase('recording');
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    },
+    [clock, song],
+  );
 
-  const handleStart = () => {
+  const handleStart = async () => {
     if (phase === 'idle') {
-      if (camera.status === 'idle') camera.request();
-      startCountdown(3, beginRecording);
+      let stream = camera.stream();
+      if (!stream) stream = await camera.request();
+      startCountdown(3, () => {
+        void beginRecording(stream);
+      });
       return;
+    }
+    await resumeAudio(getAudioContext());
+    if (phase === 'paused') {
+      mrRef.current?.play(clock.posRef.current);
+      recorderRef.current?.resume();
     }
     clock.play();
     setPhase('recording');
@@ -123,32 +162,77 @@ export function RecordingScreen({ songId }: { songId: string }) {
   const handlePause = () => {
     clock.pause();
     setPhase('paused');
-    stopMr();
+    // stop the MR but keep the source object so resuming can continue
+    mrRef.current?.stop();
+    recorderRef.current?.pause();
   };
 
   const handleRetake = () => {
     stopCountdown();
     stopMr();
+    recorderRef.current?.cancel();
+    recorderRef.current = null;
     clock.reset();
     setPhase('idle');
     showToast('녹음을 지우고 처음부터 다시 시작할게요');
   };
 
-  const handleFinish = () => {
+  const handleFinish = async () => {
+    if (finishingRef.current) return;
+    finishingRef.current = true;
     clock.pause();
-    stopMr();
     stopCountdown();
+    stopMr();
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    let recorded = null;
+    try {
+      recorded = recorder ? await recorder.stop() : null;
+    } catch {
+      recorded = null;
+    }
+
+    const durationSec = Math.max(
+      1,
+      recorded?.durationSec && recorded.durationSec > 0.4
+        ? recorded.durationSec
+        : clock.posRef.current > 1
+        ? clock.posRef.current
+        : song.durationSec,
+    );
+
+    const videoBlob = recorded?.video?.blob ?? recorded?.combined?.blob ?? null;
+    const vocalBlob = recorded?.vocal?.blob ?? recorded?.combined?.blob ?? null;
+
+    let videoUrl: string | undefined;
+    let vocalUrl: string | undefined;
+    try {
+      if (videoBlob) videoUrl = URL.createObjectURL(videoBlob);
+      if (vocalBlob) vocalUrl = vocalBlob === videoBlob ? videoUrl : URL.createObjectURL(vocalBlob);
+    } catch {
+      videoUrl = undefined;
+      vocalUrl = undefined;
+    }
+
     setTake({
       songId: song.id,
-      durationSec: clock.pos > 3 ? clock.pos : song.durationSec,
+      durationSec,
       settings: DEFAULT_SETTINGS,
       createdAt: Date.now(),
+      videoUrl,
+      vocalUrl,
+      videoMime: recorded?.video?.mime,
+      audioMime: recorded?.vocal?.mime,
+      hasVideo: Boolean(videoUrl),
+      captureMode: recorded?.mode ?? 'none',
     });
+    finishingRef.current = false;
     navigate({ name: 'result', songId: song.id }, { replace: true });
   };
 
   /* -------------------------------- lyrics -------------------------------- */
   const highlightIndex = useMemo(() => {
+    if (song.lyrics.length === 0) return -1;
     const current = song.lyrics.findIndex(line => clock.pos >= line.start && clock.pos < line.end);
     if (current >= 0) return current;
     const upcoming = song.lyrics.findIndex(line => line.start > clock.pos);
@@ -156,6 +240,7 @@ export function RecordingScreen({ songId }: { songId: string }) {
   }, [clock.pos, song.lyrics]);
 
   const visibleLyrics = useMemo(() => {
+    if (highlightIndex < 0) return [];
     const start = Math.max(0, highlightIndex - 1);
     return song.lyrics.slice(start, start + 3).map((line, offset) => ({
       line,
@@ -163,15 +248,16 @@ export function RecordingScreen({ songId }: { songId: string }) {
     }));
   }, [highlightIndex, song.lyrics]);
 
-  const activeLine = song.lyrics[highlightIndex];
+  const activeLine = highlightIndex >= 0 ? song.lyrics[highlightIndex] : null;
   const lineProgress = activeLine
     ? Math.min(1, Math.max(0, (clock.pos - activeLine.start) / (activeLine.end - activeLine.start)))
     : 0;
 
   const recording = phase === 'recording';
   const progress = clock.pos / song.durationSec;
-  const canFinish = clock.pos > 1.2;
+  const canFinish = clock.pos > 1.2 || recording;
   const showCameraButton = camera.status !== 'live';
+  const liveCamera = camera.status === 'live';
 
   return (
     <View style={styles.root}>
@@ -192,13 +278,8 @@ export function RecordingScreen({ songId }: { songId: string }) {
       {/* 9:16 viewport */}
       <View style={styles.stageArea} onLayout={onStageLayout}>
         {viewport.width > 0 ? (
-          <View
-            style={[
-              styles.viewport,
-              { width: viewport.width, height: viewport.height },
-            ]}
-          >
-            {camera.status === 'live' ? (
+          <View style={[styles.viewport, { width: viewport.width, height: viewport.height }]}>
+            {liveCamera ? (
               <View ref={camera.setContainerRef} style={StyleSheet.absoluteFill} />
             ) : (
               <MockCamera />
@@ -274,29 +355,35 @@ export function RecordingScreen({ songId }: { songId: string }) {
                 style={StyleSheet.absoluteFill}
               />
               <View style={{ paddingHorizontal: 13, paddingBottom: 24, paddingTop: 44 }}>
-                {visibleLyrics.map(({ line, index }) => {
-                  const active = index === highlightIndex;
-                  return (
-                    <View key={`${line.start}-${index}`} style={{ marginBottom: active ? 7 : 5 }}>
-                      {active ? (
-                        wrapPhrase(line.text, 15).map((row, rowIndex) => (
-                          <Text key={rowIndex} style={[styles.lyricText, styles.lyricTextActive]}>
-                            {row}
+                {visibleLyrics.length === 0 ? (
+                  <Text style={[styles.lyricText, styles.lyricTextIdle]}>
+                    가사 없이 MR로 연주돼요
+                  </Text>
+                ) : (
+                  visibleLyrics.map(({ line, index }) => {
+                    const active = index === highlightIndex;
+                    return (
+                      <View key={`${line.start}-${index}`} style={{ marginBottom: active ? 7 : 5 }}>
+                        {active ? (
+                          wrapPhrase(line.text, 15).map((row, rowIndex) => (
+                            <Text key={rowIndex} style={[styles.lyricText, styles.lyricTextActive]}>
+                              {row}
+                            </Text>
+                          ))
+                        ) : (
+                          <Text numberOfLines={2} style={[styles.lyricText, styles.lyricTextIdle]}>
+                            {line.text}
                           </Text>
-                        ))
-                      ) : (
-                        <Text numberOfLines={2} style={[styles.lyricText, styles.lyricTextIdle]}>
-                          {line.text}
-                        </Text>
-                      )}
-                      {active ? (
-                        <View style={styles.lineTrack}>
-                          <View style={[styles.lineFill, { width: `${lineProgress * 100}%` }]} />
-                        </View>
-                      ) : null}
-                    </View>
-                  );
-                })}
+                        )}
+                        {active ? (
+                          <View style={styles.lineTrack}>
+                            <View style={[styles.lineFill, { width: `${lineProgress * 100}%` }]} />
+                          </View>
+                        ) : null}
+                      </View>
+                    );
+                  })
+                )}
               </View>
             </View>
 
@@ -304,7 +391,9 @@ export function RecordingScreen({ songId }: { songId: string }) {
             <View style={styles.camSlot} pointerEvents="box-none">
               {showCameraButton ? (
                 <Pressable
-                  onPress={camera.request}
+                  onPress={() => {
+                    void camera.request();
+                  }}
                   style={({ pressed }) => [styles.camButton, pressed && { opacity: 0.8 }]}
                 >
                   <Text style={styles.camButtonText}>
@@ -320,7 +409,7 @@ export function RecordingScreen({ songId }: { songId: string }) {
               ) : (
                 <View style={styles.liveBadge}>
                   <View style={styles.liveDot} />
-                  <Text style={styles.liveText}>LIVE CAM</Text>
+                  <Text style={styles.liveText}>LIVE CAM · MIC</Text>
                 </View>
               )}
             </View>
@@ -332,7 +421,6 @@ export function RecordingScreen({ songId }: { songId: string }) {
                 <Text style={styles.countdownLabel}>곧 시작해요 · 준비하세요</Text>
               </View>
             ) : null}
-
           </View>
         ) : null}
       </View>
@@ -357,7 +445,10 @@ export function RecordingScreen({ songId }: { songId: string }) {
           />
 
           <Pressable
-            onPress={recording ? handlePause : handleStart}
+            onPress={() => {
+              if (recording) handlePause();
+              else void handleStart();
+            }}
             style={({ pressed }) => [styles.mainButton, pressed && { transform: [{ scale: 0.97 }] }]}
           >
             {recording ? (
@@ -374,7 +465,9 @@ export function RecordingScreen({ songId }: { songId: string }) {
 
           <ControlButton
             label="녹음 완료"
-            onPress={handleFinish}
+            onPress={() => {
+              void handleFinish();
+            }}
             disabled={!canFinish}
             tone="mint"
             icon={<Text style={styles.doneGlyph}>✓</Text>}
@@ -383,10 +476,12 @@ export function RecordingScreen({ songId }: { songId: string }) {
 
         <Text style={styles.hint}>
           {recording
-            ? '박자에 맞춰 가사가 넘어가요 · 이어폰 착용을 권장해요'
+            ? liveCamera
+              ? '전면 카메라·마이크로 실제 녹화 중 · 이어폰 착용을 권장해요'
+              : 'MR과 함께 타이머 녹화 중 · 카메라 권한이 없어 모의 프리뷰로 저장돼요'
             : phase === 'paused'
             ? '일시정지 상태예요. 이어서 녹음하거나 완료할 수 있어요'
-            : '3초 카운트다운 후 MR과 함께 녹음이 시작됩니다'}
+            : '3초 카운트다운 후 MR과 함께 실제 녹음이 시작됩니다'}
         </Text>
       </View>
     </View>

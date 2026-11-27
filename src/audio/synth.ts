@@ -1,7 +1,9 @@
 /**
- * Tiny Web Audio "MR" synthesizer used for the preview / recording demo on web.
- * On native (or any environment without AudioContext) callers fall back to a
- * silent timer so the UI still behaves like a player.
+ * Tiny Web Audio "MR" synthesizer used for the demo catalogue (the songs that
+ * ship without an audio file). Uploaded MRs play their real file instead.
+ *
+ * It can be attached to any AudioContext / destination node so the same mix
+ * graph can balance the MR against the recorded vocal.
  */
 
 export type SynthHandle = { stop: () => void };
@@ -35,24 +37,28 @@ const midiToFreq = (midi: number) => 440 * Math.pow(2, (midi - 69) / 12);
 
 export const synthSupported = () => {
   const g = globalThis as unknown as Record<string, unknown>;
-  return typeof (g.AudioContext ?? g.webkitAudioContext) === 'function';
+  return typeof (g.AudioContext ?? (g as any).webkitAudioContext) === 'function';
 };
 
-export function startSynth(mode: SynthMode = 'ballad', bpm = 80): SynthHandle | null {
-  const g = globalThis as unknown as Record<string, any>;
-  const AudioCtor = g.AudioContext ?? g.webkitAudioContext;
-  if (typeof AudioCtor !== 'function') return null;
+export interface SynthOptions {
+  /** node the synth plays into (defaults to the context destination) */
+  destination?: any;
+  /** overall gain of the synth bus */
+  gain?: number;
+}
 
-  let ctx: any;
-  try {
-    ctx = new AudioCtor();
-  } catch {
-    return null;
-  }
+/** Start the MR synth on an existing AudioContext. */
+export function startSynthOn(
+  ctx: any,
+  mode: SynthMode = 'ballad',
+  bpm = 80,
+  options: SynthOptions = {},
+): SynthHandle | null {
+  if (!ctx) return null;
 
   const master: any = ctx.createGain();
-  master.gain.value = 0.55;
-  master.connect(ctx.destination);
+  master.gain.value = options.gain ?? 0.55;
+  master.connect(options.destination ?? ctx.destination);
 
   const beat = 60 / bpm;
   const stepDur = beat / 2;
@@ -68,24 +74,29 @@ export function startSynth(mode: SynthMode = 'ballad', bpm = 80): SynthHandle | 
     opts: { type?: string; gain?: number; glideTo?: number } = {},
   ) => {
     if (stopped) return;
-    const osc: any = ctx.createOscillator();
-    const env: any = ctx.createGain();
-    osc.type = opts.type ?? 'triangle';
-    osc.frequency.setValueAtTime(freq, at);
-    if (opts.glideTo) osc.frequency.exponentialRampToValueAtTime(opts.glideTo, at + dur);
+    try {
+      const osc: any = ctx.createOscillator();
+      const env: any = ctx.createGain();
+      osc.type = opts.type ?? 'triangle';
+      osc.frequency.setValueAtTime(freq, at);
+      if (opts.glideTo) osc.frequency.exponentialRampToValueAtTime(opts.glideTo, at + dur);
 
-    const peak = opts.gain ?? 0.06;
-    env.gain.setValueAtTime(0.0001, at);
-    env.gain.exponentialRampToValueAtTime(peak, at + 0.02);
-    env.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+      const peak = opts.gain ?? 0.06;
+      env.gain.setValueAtTime(0.0001, at);
+      env.gain.exponentialRampToValueAtTime(peak, at + 0.02);
+      env.gain.exponentialRampToValueAtTime(0.0001, at + dur);
 
-    osc.connect(env);
-    env.connect(master);
-    osc.start(at);
-    osc.stop(at + dur + 0.05);
+      osc.connect(env);
+      env.connect(master);
+      osc.start(at);
+      osc.stop(at + dur + 0.05);
+    } catch {
+      // scheduling after close
+    }
   };
 
   const schedule = () => {
+    if (stopped) return;
     while (nextTime < ctx.currentTime + 0.5) {
       const at = nextTime;
       const chordIndex = Math.floor(step / 8) % chords.length;
@@ -122,7 +133,7 @@ export function startSynth(mode: SynthMode = 'ballad', bpm = 80): SynthHandle | 
     }
   };
 
-  const timer = setInterval(schedule, 120);
+  let timer: any = setInterval(schedule, 120);
   schedule();
 
   return {
@@ -130,6 +141,7 @@ export function startSynth(mode: SynthMode = 'ballad', bpm = 80): SynthHandle | 
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
+      timer = null;
       try {
         master.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.05);
       } catch {
@@ -137,11 +149,45 @@ export function startSynth(mode: SynthMode = 'ballad', bpm = 80): SynthHandle | 
       }
       setTimeout(() => {
         try {
-          ctx.close();
+          master.disconnect();
         } catch {
           // ignore
         }
       }, 350);
+    },
+  };
+}
+
+/** Legacy helper: opens its own AudioContext (only used where no graph exists). */
+export function startSynth(mode: SynthMode = 'ballad', bpm = 80): SynthHandle | null {
+  const g = globalThis as unknown as Record<string, any>;
+  const AudioCtor = g.AudioContext ?? g.webkitAudioContext;
+  if (typeof AudioCtor !== 'function') return null;
+  let ctx: any;
+  try {
+    ctx = new AudioCtor();
+  } catch {
+    return null;
+  }
+  const handle = startSynthOn(ctx, mode, bpm);
+  if (!handle) {
+    try {
+      ctx.close();
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+  return {
+    stop: () => {
+      handle.stop();
+      setTimeout(() => {
+        try {
+          ctx.close();
+        } catch {
+          // ignore
+        }
+      }, 400);
     },
   };
 }

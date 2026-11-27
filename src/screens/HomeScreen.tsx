@@ -10,7 +10,7 @@ import {
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { colors, radius, safeTop, space, type } from '../theme';
-import { genreOrder, creators, recentSongIds, songs, findCreator } from '../data/mock';
+import { genreOrder, creators, recentSongIds, findCreator } from '../data/mock';
 import { Genre, Song } from '../types';
 import { CoverArt } from '../components/CoverArt';
 import { SongRow } from '../components/SongRow';
@@ -22,7 +22,7 @@ import { formatCount, formatTime } from '../utils/format';
 type SortKey = 'latest' | 'popular';
 
 export function HomeScreen() {
-  const { navigate, showToast } = useStore();
+  const { navigate, showToast, songs } = useStore();
   const [query, setQuery] = useState('');
   const [genre, setGenre] = useState<Genre | '전체'>('전체');
   const [sort, setSort] = useState<SortKey>('latest');
@@ -38,7 +38,7 @@ export function HomeScreen() {
             song.artist.toLowerCase().includes(q) ||
             findCreator(song.creatorId).name.toLowerCase().includes(q),
       );
-  }, [query, genre]);
+  }, [query, genre, songs]);
 
   const browsing = query.trim().length > 0 || genre !== '전체';
 
@@ -79,7 +79,7 @@ export function HomeScreen() {
               onPress={() => navigate({ name: 'creator' })}
               style={({ pressed }) => [styles.avatar, pressed && { opacity: 0.8 }]}
             >
-              <Text style={styles.avatarText}>예</Text>
+              <Text style={styles.avatarText}>♪</Text>
             </Pressable>
           </View>
         </View>
@@ -87,7 +87,7 @@ export function HomeScreen() {
         {/* greeting */}
         <View style={styles.greeting}>
           <Text style={styles.kicker}>{dateLabel} · 오늘의 커버</Text>
-          <Text style={styles.headline}>예율 님,{'\n'}어떤 곡을 부를까요?</Text>
+          <Text style={styles.headline}>오늘,{'\n'}어떤 곡을 부를까요?</Text>
         </View>
 
         {/* search */}

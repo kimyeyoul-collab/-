@@ -5,7 +5,7 @@ import { Creator, Genre, LyricLine, Song, UploadedMr } from '../types';
  * Song titles, artists, lyrics and creators are fictional so the demo carries no
  * third-party copyright. Timings drive the karaoke line highlight in Recording.
  */
-const makeLyrics = (lines: string[], start = 5.5, lineDur = 4.0, gap = 0.6): LyricLine[] =>
+export const makeLyrics = (lines: string[], start = 5.5, lineDur = 4.0, gap = 0.6): LyricLine[] =>
   lines.map((text, i) => {
     const s = start + i * (lineDur + gap);
     return { start: s, end: s + lineDur, text };
@@ -41,6 +41,16 @@ export const creators: Creator[] = [
     verified: false,
     accent: ['#37C8F0', '#1F7AE0'],
     tagline: 'K-POP 댄스 MR · 하이라이트 구간',
+  },
+  {
+    id: 'c_me',
+    name: '내 스튜디오',
+    handle: '@my_studio',
+    mrCount: 1,
+    plays: 0,
+    verified: false,
+    accent: ['#FF4D4F', '#FF8A3D'],
+    tagline: '크리에이터 스튜디오에서 직접 올린 MR',
   },
   {
     id: 'c4',
@@ -461,6 +471,8 @@ export const initialUploads: UploadedMr[] = [
     price: 1000,
     fileName: 'saebyeok_mr_v2.wav',
     createdAt: '2026-11-08',
+    durationSec: 96,
+    demo: true,
     sales: 128,
     revenue: 64000,
     status: '판매 중',
@@ -473,6 +485,8 @@ export const initialUploads: UploadedMr[] = [
     price: 1500,
     fileName: 'neon_heart_inst.wav',
     createdAt: '2026-11-15',
+    durationSec: 88,
+    demo: true,
     sales: 86,
     revenue: 64500,
     status: '판매 중',
@@ -485,6 +499,8 @@ export const initialUploads: UploadedMr[] = [
     price: 1200,
     fileName: 'slow_motion_mr.wav',
     createdAt: '2026-11-24',
+    durationSec: 94,
+    demo: true,
     sales: 31,
     revenue: 18600,
     status: '심사 중',

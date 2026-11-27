@@ -28,6 +28,13 @@ export interface Song {
   lyrics: LyricLine[];
   isNew?: boolean;
   releasedDaysAgo: number;
+  /**
+   * Object URL of the real audio file when this song is an MR uploaded in the
+   * creator studio. Demo songs leave it empty and use the Web Audio synth.
+   */
+  audioUrl?: string;
+  /** id of the UploadedMr this song was built from */
+  uploadId?: string;
 }
 
 export interface Creator {
@@ -53,6 +60,14 @@ export interface UploadedMr {
   revenue: number;
   status: '판매 중' | '심사 중';
   isNew?: boolean;
+  /** length of the uploaded file in seconds */
+  durationSec?: number;
+  /** runtime object URL of the stored audio blob */
+  audioUrl?: string;
+  /** lyrics entered in the studio, already spread on the MR timeline */
+  lyrics?: LyricLine[];
+  /** demo rows shipped with the app (not persisted, no audio file) */
+  demo?: boolean;
 }
 
 export interface TakeSettings {
@@ -68,6 +83,15 @@ export interface TakeResult {
   durationSec: number;
   settings: TakeSettings;
   createdAt: number;
+  /** recorded camera video (or the combined fallback file) */
+  videoUrl?: string;
+  /** recorded vocal audio (or the combined fallback file) */
+  vocalUrl?: string;
+  videoMime?: string;
+  audioMime?: string;
+  hasVideo?: boolean;
+  /** how the take was captured */
+  captureMode?: 'dual' | 'single' | 'audio-only' | 'none';
 }
 
 export const DEFAULT_SETTINGS: TakeSettings = {

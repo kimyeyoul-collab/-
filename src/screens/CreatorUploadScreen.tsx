@@ -11,8 +11,9 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { colors, radius, safeTop, space, type } from '../theme';
 import { useStore } from '../store';
 import { genreOrder } from '../data/mock';
-import { Genre, UploadedMr } from '../types';
-import { formatBytes, formatWon, todayLabel, uid } from '../utils/format';
+import { Genre, LyricLine, UploadedMr } from '../types';
+import { formatWon, todayLabel, uid } from '../utils/format';
+import { formatFileSize, readAudioDuration } from '../utils/mrLibrary';
 import { TopBar } from '../components/TopBar';
 import { Badge, Card, Chip, Field, GhostButton, PrimaryButton, SectionHeader } from '../components/ui';
 import { CoverArt } from '../components/CoverArt';
@@ -21,19 +22,41 @@ import { CheckIcon, PlusIcon, ArrowUpIcon } from '../components/Icons';
 interface PickedFile {
   name: string;
   size: number;
+  durationSec: number;
+  blob: any;
+  url: string;
   mocked?: boolean;
 }
 
 const PRICE_OPTIONS = [500, 1000, 1500, 2000];
+const MAX_BYTES = 50 * 1024 * 1024;
+
+/** Spread the studio-entered lyrics over the uploaded MR timeline. */
+function buildLyrics(text: string, durationSec: number): LyricLine[] {
+  const lines = text
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return [];
+  const total = Math.max(6, durationSec - 4);
+  const slot = total / lines.length;
+  return lines.map((line, index) => ({
+    start: 2 + index * slot,
+    end: 2 + index * slot + Math.max(1.2, slot - 0.4),
+    text: line,
+  }));
+}
 
 export function CreatorUploadScreen() {
-  const { back, depth, uploads, addUpload, showToast } = useStore();
+  const { back, depth, uploads, addUpload, showToast, navigate } = useStore();
 
   const [file, setFile] = useState<PickedFile | null>(null);
   const [title, setTitle] = useState('');
   const [artist, setArtist] = useState('');
   const [genre, setGenre] = useState<Genre>('발라드');
   const [priceText, setPriceText] = useState('1000');
+  const [lyricsText, setLyricsText] = useState('');
+  const [busy, setBusy] = useState(false);
 
   const price = Number(priceText.replace(/[^0-9]/g, '')) || 0;
   const creatorShare = Math.round(price * 0.5);
@@ -46,7 +69,8 @@ export function CreatorUploadScreen() {
     return { sales, revenue, reviewing };
   }, [uploads]);
 
-  const canSubmit = Boolean(file) && title.trim().length > 1 && artist.trim().length > 0 && price >= 100;
+  const canSubmit =
+    Boolean(file) && title.trim().length > 1 && artist.trim().length > 0 && price >= 100 && !busy;
 
   const pickFile = () => {
     const g = globalThis as unknown as Record<string, any>;
@@ -55,24 +79,59 @@ export function CreatorUploadScreen() {
       input.type = 'file';
       input.accept = 'audio/*';
       input.style.display = 'none';
-      input.onchange = (event: any) => {
+      input.onchange = async (event: any) => {
         const chosen = event.target?.files?.[0];
-        if (chosen) {
-          setFile({ name: chosen.name ?? 'mr_audio.wav', size: chosen.size ?? 0 });
-          showToast('MR 음원 파일을 불러왔어요');
+        if (!chosen) return;
+        if (chosen.size > MAX_BYTES) {
+          showToast('50MB 이하 파일만 업로드할 수 있어요', 'alert');
+          return;
         }
+        const url = URL.createObjectURL(chosen);
+        const duration = await readAudioDuration(url);
+        setFile({
+          name: chosen.name ?? 'mr_audio.wav',
+          size: chosen.size ?? 0,
+          durationSec: duration > 0 ? duration : 90,
+          blob: chosen,
+          url,
+        });
+        if (!title.trim()) {
+          setTitle(
+            (chosen.name ?? '')
+              .replace(/\.[^.]+$/, '')
+              .replace(/[_-]+/g, ' ')
+              .trim()
+              .slice(0, 40),
+          );
+        }
+        showToast(
+          duration > 0
+            ? `실제 MR 파일을 불러왔어요 · ${Math.floor(duration / 60)}:${String(
+                Math.floor(duration % 60),
+              ).padStart(2, '0')}`
+            : 'MR 음원 파일을 불러왔어요',
+        );
       };
       g.document.body.appendChild(input);
       input.click();
       setTimeout(() => input.remove?.(), 1000);
       return;
     }
-    setFile({ name: `sample_mr_${Date.now().toString().slice(-4)}.wav`, size: 8420000, mocked: true });
+    setFile({
+      name: `sample_mr_${Date.now().toString().slice(-4)}.wav`,
+      size: 8420000,
+      durationSec: 90,
+      blob: null,
+      mocked: true,
+      url: '',
+    });
     showToast('샘플 MR 파일을 선택했어요');
   };
 
-  const submit = () => {
+  const submit = async () => {
     if (!canSubmit || !file) return;
+    setBusy(true);
+    const lyrics = buildLyrics(lyricsText, file.durationSec);
     const upload: UploadedMr = {
       id: uid('mr'),
       title: title.trim(),
@@ -85,13 +144,24 @@ export function CreatorUploadScreen() {
       revenue: 0,
       status: '심사 중',
       isNew: true,
+      durationSec: Math.round(file.durationSec),
+      audioUrl: file.url || undefined,
+      lyrics,
     };
-    addUpload(upload);
-    setFile(null);
-    setTitle('');
-    setArtist('');
-    setPriceText('1000');
-    showToast('MR을 업로드했어요 · 24시간 내 심사가 시작됩니다');
+    try {
+      await addUpload(upload, file.blob);
+      showToast('MR을 업로드했어요 · 홈 목록 최상단에 추가됐어요');
+      setFile(null);
+      setTitle('');
+      setArtist('');
+      setLyricsText('');
+      setPriceText('1000');
+      navigate({ name: 'home' });
+    } catch {
+      showToast('업로드에 실패했어요. 다시 시도해 주세요', 'alert');
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -162,8 +232,11 @@ export function CreatorUploadScreen() {
                 </Text>
                 <Text style={styles.dropCaption}>
                   {file
-                    ? `${formatBytes(file.size)} · WAV/MP3${file.mocked ? ' · 샘플 파일' : ''}`
-                    : 'WAV · MP3 · 최대 50MB, 보컬이 없는 반주만'}
+                    ? `${formatFileSize(file.size)} · ${Math.floor(file.durationSec / 60)}:${String(
+                        Math.round(file.durationSec % 60),
+                      ).padStart(2, '0')}${file.mocked ? ' · 샘플 파일' : ' · 실제 파일'}
+                    `
+                    : 'WAV · MP3 · M4A · 최대 50MB, 보컬이 없는 반주만'}
                 </Text>
               </View>
               <Text style={styles.dropAction}>{file ? '변경' : '찾아보기'}</Text>
@@ -202,6 +275,19 @@ export function CreatorUploadScreen() {
             <View style={{ height: space(4) }} />
 
             <Field
+              label="가사 (선택)"
+              hint="줄바꿈으로 구분 · 촬영 자막 타임라인으로 변환"
+              value={lyricsText}
+              onChangeText={setLyricsText}
+              placeholder={'첫 번째 줄\n두 번째 줄\n세 번째 줄'}
+              multiline
+              numberOfLines={4}
+              inputStyle={{ height: 84, textAlignVertical: 'top', paddingTop: 8 }}
+            />
+
+            <View style={{ height: space(4) }} />
+
+            <Field
               label="판매 가격"
               hint="플랫폼 수수료 50%"
               value={priceText}
@@ -221,9 +307,7 @@ export function CreatorUploadScreen() {
                     pressed && { opacity: 0.8 },
                   ]}
                 >
-                  <Text
-                    style={[styles.priceQuickText, price === option && { color: colors.coral }]}
-                  >
+                  <Text style={[styles.priceQuickText, price === option && { color: colors.coral }]}>
                     ₩{option.toLocaleString('ko-KR')}
                   </Text>
                 </Pressable>
@@ -258,14 +342,16 @@ export function CreatorUploadScreen() {
             </View>
 
             <PrimaryButton
-              label={canSubmit ? 'MR 업로드하기' : '필수 항목을 입력해 주세요'}
-              onPress={submit}
+              label={canSubmit ? 'MR 업로드하기' : busy ? '업로드 중…' : '필수 항목을 입력해 주세요'}
+              onPress={() => {
+                void submit();
+              }}
               disabled={!canSubmit}
               icon={<ArrowUpIcon size={12} color={colors.white} />}
               style={{ marginTop: space(4) }}
             />
             <Text style={styles.formNote}>
-              업로드 후 24시간 이내 심사 · 저작권 침해 시 반려될 수 있어요
+              업로드 즉시 홈 목록 최상단에 노출되고, 곡 상세·촬영·결과 화면에서 업로드한 원음이 재생됩니다
             </Text>
           </Card>
         </View>
@@ -309,9 +395,11 @@ function UploadRow({ item }: { item: UploadedMr }) {
             {item.title}
           </Text>
           {item.isNew ? <Badge label="NEW" tone="coral" /> : null}
+          {item.audioUrl ? <Badge label="원음" tone="mint" /> : null}
         </View>
         <Text style={styles.uploadMeta}>
           {item.artist} · {item.genre} · {formatWon(item.price)}
+          {item.durationSec ? ` · ${Math.floor(item.durationSec / 60)}:${String(Math.round(item.durationSec % 60)).padStart(2, '0')}` : ''}
         </Text>
         <View style={styles.uploadStats}>
           <Badge label={item.status} tone={item.status === '판매 중' ? 'mint' : 'amber'} dot />
@@ -428,7 +516,7 @@ const styles = StyleSheet.create({
   splitLegendValue: { ...type.micro, color: colors.mint, fontSize: 9.5 },
   splitLegendValueNeutral: { ...type.micro, color: colors.textDim, fontSize: 9.5 },
   splitFootnote: { ...type.micro, color: colors.textFaint, marginTop: 8, fontSize: 9, fontWeight: '500' },
-  formNote: { ...type.micro, color: colors.textFaint, marginTop: space(2), fontSize: 9, textAlign: 'center', fontWeight: '500' },
+  formNote: { ...type.micro, color: colors.textFaint, marginTop: space(2), fontSize: 9, textAlign: 'center', fontWeight: '500', lineHeight: 13 },
   uploadRow: {
     flexDirection: 'row',
     alignItems: 'center',

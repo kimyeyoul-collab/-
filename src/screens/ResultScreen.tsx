@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
@@ -10,16 +10,17 @@ import {
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { absoluteFill, colors, radius, safeTop, shadow, space, type } from '../theme';
-import { findSong } from '../data/mock';
 import { useStore } from '../store';
 import { DEFAULT_SETTINGS, TakeSettings } from '../types';
-import { useClock } from '../hooks/useClock';
 import { CoverArt } from '../components/CoverArt';
 import { RangeSlider } from '../components/RangeSlider';
 import { TopBar } from '../components/TopBar';
 import { Badge, Card, Chip, GhostButton, IconButton, PrimaryButton } from '../components/ui';
 import { CheckIcon, NoteGlyph, PauseIcon, PlayIcon, CloseIcon } from '../components/Icons';
 import { formatTime, wrapPhrase } from '../utils/format';
+import { createTakeMixer, TakeMixer } from '../audio/mixer';
+import { syncOffsetSec } from '../audio/webaudio';
+import { downloadVideo, exportCoverVideo, shareVideo } from '../media/exportVideo';
 
 type Preset = { key: string; label: string; values: TakeSettings };
 
@@ -30,75 +31,257 @@ const PRESETS: Preset[] = [
   { key: 'aca', label: '아카펠라', values: { vocal: 96, mr: 24, echo: 22, reverb: 58, syncMs: 0 } },
 ];
 
-const STEPS = ['오디오 믹싱', '영상 인코딩', '자막 합성', '썸네일 생성', '마무리 중'];
+interface ExportedVideo {
+  url: string;
+  blob: any;
+  mime: string;
+  extension: 'mp4' | 'webm';
+  size: number;
+  width: number;
+  height: number;
+}
 
 export function ResultScreen({ songId }: { songId: string }) {
-  const song = findSong(songId);
-  const { back, navigate, take, showToast } = useStore();
-  const clock = useClock(song.durationSec);
+  const { back, navigate, take, showToast, getSong } = useStore();
+  const song = getSong(songId);
+  const duration = Math.max(1, take?.durationSec ?? song.durationSec);
+  const hasVideo = Boolean(take?.videoUrl);
 
   const [settings, setSettings] = useState<TakeSettings>(take?.settings ?? DEFAULT_SETTINGS);
   const [preset, setPreset] = useState<string | null>(null);
 
+  const mixerRef = useRef<TakeMixer | null>(null);
+  const videoNodeRef = useRef<any>(null);
+  const [stageNode, setStageNode] = useState<any>(null);
+  const [ready, setReady] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [pos, setPos] = useState(0);
+
   const [modalOpen, setModalOpen] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [generated, setGenerated] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [exported, setExported] = useState<ExportedVideo | null>(null);
+  const cancelRef = useRef(false);
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
 
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const setStageRef = useCallback((node: any) => setStageNode(node ?? null), []);
 
-  /* auto preview so the 9:16 frame feels alive on arrival */
+  /* real <video> stage showing the recorded take (mirrored like the preview) */
   useEffect(() => {
-    const id = setTimeout(() => clock.play(), 350);
-    return () => clearTimeout(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const doc = (globalThis as unknown as Record<string, any>).document;
+    if (!stageNode || !doc) return;
+    let video = videoNodeRef.current;
+    if (!video) {
+      video = doc.createElement('video');
+      video.setAttribute('playsinline', 'playsinline');
+      video.setAttribute('muted', 'muted');
+      video.muted = true;
+      video.playsInline = true;
+      video.style.width = '100%';
+      video.style.height = '100%';
+      video.style.objectFit = 'cover';
+      video.style.transform = 'scaleX(-1)';
+      video.style.display = 'block';
+      videoNodeRef.current = video;
+    }
+    if (video.parentNode !== stageNode) stageNode.appendChild(video);
+    if (take?.videoUrl) {
+      if (video.src !== take.videoUrl) video.src = take.videoUrl;
+      video.load?.();
+    }
+    return () => {
+      // element is removed with the node
+    };
+  }, [stageNode, take?.videoUrl]);
 
   useEffect(
     () => () => {
-      if (timerRef.current) clearInterval(timerRef.current);
+      const video = videoNodeRef.current;
+      if (video?.parentNode) video.parentNode.removeChild(video);
+      videoNodeRef.current = null;
     },
     [],
   );
 
-  const activeIndex = useMemo(() => {
-    const current = song.lyrics.findIndex(line => clock.pos >= line.start && clock.pos < line.end);
-    if (current >= 0) return current;
-    const next = song.lyrics.findIndex(line => line.start > clock.pos);
-    return next >= 0 ? next : song.lyrics.length - 1;
-  }, [clock.pos, song.lyrics]);
+  /* playback engine with the live mix graph */
+  useEffect(() => {
+    let disposed = false;
+    let mixer: TakeMixer | null = null;
+    setReady(false);
+    setPlaying(false);
+    setPos(0);
+    const run = async () => {
+      const created = await createTakeMixer({
+        song,
+        durationSec: duration,
+        settings: settingsRef.current,
+        vocalUrl: take?.vocalUrl,
+        getVideo: () => videoNodeRef.current,
+      });
+      if (disposed) {
+        created?.dispose();
+        return;
+      }
+      mixer = created;
+      mixerRef.current = created;
+      setReady(Boolean(created));
+    };
+    void run();
+    return () => {
+      disposed = true;
+      mixerRef.current = null;
+      mixer?.dispose();
+      setPlaying(false);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [song.id, take?.vocalUrl, duration]);
 
-  const activeLine = song.lyrics[activeIndex];
-  const nextLine = song.lyrics[activeIndex + 1];
+  useEffect(() => {
+    const id = setInterval(() => {
+      const mixer = mixerRef.current;
+      if (!mixer) return;
+      setPos(mixer.position());
+      setPlaying(mixer.isPlaying());
+    }, 120);
+    return () => clearInterval(id);
+  }, []);
+
+  const togglePlay = async () => {
+    const mixer = mixerRef.current;
+    if (!mixer) {
+      showToast('오디오를 아직 준비 중이에요. 잠시 후 다시 시도해 주세요');
+      return;
+    }
+    if (mixer.isPlaying()) {
+      mixer.pause();
+      setPlaying(false);
+      setPos(mixer.position());
+      return;
+    }
+    await mixer.play();
+    setPlaying(mixer.isPlaying());
+  };
+
+  const seek = (value: number) => {
+    mixerRef.current?.seek(value);
+    setPos(value);
+  };
 
   const update = (patch: Partial<TakeSettings>) => {
-    setSettings(current => ({ ...current, ...patch }));
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    mixerRef.current?.setSettings(next);
     setPreset(null);
   };
 
-  const startGeneration = () => {
+  const applyPreset = (item: Preset) => {
+    setSettings(item.values);
+    mixerRef.current?.setSettings(item.values);
+    setPreset(item.key);
+    showToast(`${item.label} 프리셋을 적용했어요`);
+  };
+
+  /* ------------------------------ export ------------------------------ */
+  const startGeneration = async () => {
     if (generating) return;
     setModalOpen(true);
     setGenerating(true);
-    setGenerated(false);
     setProgress(0);
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = setInterval(() => {
-      setProgress(current => {
-        const next = Math.min(100, current + 2 + Math.random() * 4);
-        if (next >= 100) {
-          if (timerRef.current) clearInterval(timerRef.current);
-          timerRef.current = null;
-          setGenerating(false);
-          setGenerated(true);
-          showToast('커버 영상이 완성됐어요');
-        }
-        return next;
+    setElapsed(0);
+    setExported(null);
+    cancelRef.current = false;
+    mixerRef.current?.pause();
+    setPlaying(false);
+    try {
+      const result = await exportCoverVideo({
+        song,
+        durationSec: duration,
+        videoUrl: take?.videoUrl,
+        vocalUrl: take?.vocalUrl,
+        settings,
+        onProgress: (ratio, seconds) => {
+          setProgress(ratio * 100);
+          setElapsed(seconds);
+        },
+        isCancelled: () => cancelRef.current,
       });
-    }, 70);
+      if (cancelRef.current) {
+        setExported(null);
+        showToast('영상 생성을 취소했어요');
+        setModalOpen(false);
+        return;
+      }
+      const url = URL.createObjectURL(result.blob);
+      setExported({
+        url,
+        blob: result.blob,
+        mime: result.mime,
+        extension: result.extension,
+        size: result.blob.size,
+        width: result.width,
+        height: result.height,
+      });
+      setProgress(100);
+      showToast('커버 영상 파일이 완성됐어요');
+    } catch {
+      showToast('영상 생성에 실패했어요. 다시 시도해 주세요', 'alert');
+      setModalOpen(false);
+    } finally {
+      setGenerating(false);
+    }
   };
 
-  const stepIndex = Math.min(STEPS.length - 1, Math.floor((progress / 100) * STEPS.length));
+  const fileName = useMemo(
+    () => `karaoke-cover-${song.title.replace(/\s+/g, '-')}.${exported?.extension ?? 'mp4'}`,
+    [song.title, exported?.extension],
+  );
+
+  const saveToDevice = () => {
+    if (!exported) return;
+    const ok = downloadVideo(exported.blob, fileName);
+    showToast(ok ? '영상을 기기에 저장했어요' : '다운로드를 시작할 수 없어요', ok ? 'ok' : 'alert');
+  };
+
+  const shareOut = async () => {
+    if (!exported) {
+      showToast('먼저 최종 영상을 생성해 주세요');
+      return;
+    }
+    const shared = await shareVideo(
+      exported.blob,
+      fileName,
+      `${song.title} 커버`,
+      `${song.artist} · Karaoke Cover Studio`,
+    );
+    if (shared) {
+      showToast('공유 시트를 열었어요');
+    } else {
+      downloadVideo(exported.blob, fileName);
+      showToast('이 브라우저는 파일 공유를 지원하지 않아 다운로드했어요');
+    }
+  };
+
+  const closeModal = () => {
+    cancelRef.current = true;
+    setModalOpen(false);
+  };
+
+  /* ------------------------------ lyrics ------------------------------ */
+  const audioPos = Math.max(0, pos - syncOffsetSec(settings));
+  const activeIndex = useMemo(() => {
+    if (song.lyrics.length === 0) return -1;
+    const current = song.lyrics.findIndex(line => audioPos >= line.start && audioPos < line.end);
+    if (current >= 0) return current;
+    const next = song.lyrics.findIndex(line => line.start > audioPos);
+    return next >= 0 ? next : song.lyrics.length - 1;
+  }, [audioPos, song.lyrics]);
+
+  const activeLine = activeIndex >= 0 ? song.lyrics[activeIndex] : null;
+  const nextLine = activeIndex >= 0 ? song.lyrics[activeIndex + 1] : null;
+
+  const specSize = exported ? `${(exported.size / (1024 * 1024)).toFixed(1)}MB` : '생성 후 표시';
 
   return (
     <View style={styles.root}>
@@ -108,7 +291,7 @@ export function ResultScreen({ songId }: { songId: string }) {
           title="결과물 편집"
           subtitle={`${song.title} · ${song.artist}`}
           right={
-            <IconButton size={34} onPress={() => showToast('공유 링크를 복사했어요 (데모)')}>
+            <IconButton size={34} onPress={() => void shareOut()} accessibilityLabel="커버 영상 공유">
               <Text style={{ fontSize: 13, color: colors.textDim }}>↗</Text>
             </IconButton>
           }
@@ -119,31 +302,37 @@ export function ResultScreen({ songId }: { songId: string }) {
         {/* 9:16 preview */}
         <View style={styles.previewWrap}>
           <View style={styles.preview}>
-            <LinearGradient
-              colors={[song.cover[0], song.cover[1], '#05070A']}
-              start={{ x: 0.1, y: 0 }}
-              end={{ x: 0.9, y: 1 }}
-              style={StyleSheet.absoluteFill}
-            />
-            <View style={styles.previewGlow} />
-            <View style={styles.previewGlow2} />
-            <View style={styles.previewNotes}>
-              <NoteGlyph size={26} color="rgba(255,255,255,0.10)" />
-              <NoteGlyph size={16} color="rgba(255,255,255,0.07)" />
-            </View>
+            {hasVideo ? (
+              <View ref={setStageRef} style={StyleSheet.absoluteFill} />
+            ) : (
+              <>
+                <LinearGradient
+                  colors={[song.cover[0], song.cover[1], '#05070A']}
+                  start={{ x: 0.1, y: 0 }}
+                  end={{ x: 0.9, y: 1 }}
+                  style={StyleSheet.absoluteFill}
+                />
+                <View style={styles.previewGlow} />
+                <View style={styles.previewGlow2} />
+                <View style={styles.previewNotes}>
+                  <NoteGlyph size={26} color="rgba(255,255,255,0.10)" />
+                  <NoteGlyph size={16} color="rgba(255,255,255,0.07)" />
+                </View>
+              </>
+            )}
 
             <View style={styles.previewTop}>
-              <Badge label="COVER" tone="coral" />
-              <Text style={styles.previewSpec}>1080×1920</Text>
+              <Badge label={hasVideo ? 'MY TAKE' : 'COVER'} tone="coral" />
+              <Text style={styles.previewSpec}>9:16</Text>
             </View>
 
-            <View style={styles.previewCenter}>
-              {!clock.playing ? (
-                <Pressable onPress={clock.play} style={styles.centerPlay}>
+            <View style={styles.previewCenter} pointerEvents="box-none">
+              {!playing ? (
+                <Pressable onPress={() => void togglePlay()} style={styles.centerPlay} accessibilityLabel="커버 미리보기 재생">
                   <PlayIcon size={20} color={colors.white} />
                 </Pressable>
               ) : (
-                <Pressable onPress={clock.pause} style={styles.centerPlayGhost}>
+                <Pressable onPress={() => void togglePlay()} style={styles.centerPlayGhost} accessibilityLabel="커버 미리보기 일시정지">
                   <PauseIcon size={14} color={colors.white} />
                 </Pressable>
               )}
@@ -153,21 +342,40 @@ export function ResultScreen({ songId }: { songId: string }) {
               colors={['rgba(4,6,10,0)', 'rgba(4,6,10,0.75)', 'rgba(4,6,10,0.95)']}
               style={styles.subtitleScrim}
             />
-            <View style={styles.subtitleBox}>
-              {wrapPhrase(activeLine?.text ?? '', 12).map((row, index) => (
-                <Text key={index} style={styles.subtitleMain}>
-                  {row}
-                </Text>
-              ))}
+            <View style={styles.subtitleBox} pointerEvents="none" testID="result-subtitle">
+              {activeLine ? (
+                wrapPhrase(activeLine.text, 12).map((row, index) => (
+                  <Text key={index} style={styles.subtitleMain}>
+                    {row}
+                  </Text>
+                ))
+              ) : (
+                <Text style={styles.subtitleMain}>♪ MR ♪</Text>
+              )}
               <Text style={styles.subtitleNext} numberOfLines={1}>
                 {nextLine?.text ?? ' '}
               </Text>
               <View style={styles.subtitleBar}>
-                <View style={styles.subtitleBarFill} />
+                <View
+                  style={[
+                    styles.subtitleBarFill,
+                    activeLine
+                      ? {
+                          width: `${Math.min(
+                            100,
+                            Math.max(
+                              0,
+                              ((audioPos - activeLine.start) / (activeLine.end - activeLine.start)) * 100,
+                            ),
+                          )}%`,
+                        }
+                      : { width: '0%' },
+                  ]}
+                />
               </View>
             </View>
 
-            <View style={styles.previewBottom}>
+            <View style={styles.previewBottom} pointerEvents="none">
               <View style={styles.previewSongRow}>
                 <CoverArt cover={song.cover} size={30} radius={8} glyphSize={11} />
                 <View style={{ flex: 1 }}>
@@ -175,22 +383,31 @@ export function ResultScreen({ songId }: { songId: string }) {
                     {song.title}
                   </Text>
                   <Text style={styles.previewSongArtist} numberOfLines={1}>
-                    {song.artist} · cover by 예율
+                    {song.artist} · cover by Studio
                   </Text>
                 </View>
-                <Text style={styles.previewTime}>{formatTime(clock.pos)}</Text>
+                <Text style={styles.previewTime} testID="result-time">{formatTime(pos)}</Text>
               </View>
               <View style={styles.previewTrack}>
-                <View
-                  style={[styles.previewTrackFill, { width: `${(clock.pos / song.durationSec) * 100}%` }]}
-                />
+                <View style={[styles.previewTrackFill, { width: `${Math.min(100, (pos / duration) * 100)}%` }]} />
               </View>
             </View>
           </View>
 
           <View style={styles.previewSide}>
             <Text style={styles.previewSideLabel}>TAKE 01</Text>
-            <Text style={styles.previewSideValue}>{formatTime(take?.durationSec ?? song.durationSec)}</Text>
+            <Text style={styles.previewSideValue}>{formatTime(duration)}</Text>
+            <View style={styles.previewSideDivider} />
+            <Text style={styles.previewSideLabel}>CAPTURE</Text>
+            <Text style={styles.previewSideValue}>
+              {take?.captureMode === 'dual'
+                ? 'CAM+MIC'
+                : take?.captureMode === 'single'
+                ? '통합 녹화'
+                : take?.captureMode === 'audio-only'
+                ? '오디오만'
+                : '모의'}
+            </Text>
             <View style={styles.previewSideDivider} />
             <Text style={styles.previewSideLabel}>MIX</Text>
             <Text style={styles.previewSideValue}>
@@ -208,29 +425,37 @@ export function ResultScreen({ songId }: { songId: string }) {
         {/* transport */}
         <View style={styles.transport}>
           <IconButton
-            onPress={clock.toggle}
-            accessibilityLabel={clock.playing ? '미리보기 일시정지' : '미리보기 재생'}
+            onPress={() => void togglePlay()}
+            accessibilityLabel={playing ? '미리보기 일시정지' : '미리보기 재생'}
             size={40}
             style={{ backgroundColor: colors.coral }}
           >
-            {clock.playing ? <PauseIcon size={12} color={colors.white} /> : <PlayIcon size={13} color={colors.white} />}
+            {playing ? <PauseIcon size={12} color={colors.white} /> : <PlayIcon size={13} color={colors.white} />}
           </IconButton>
           <View style={{ flex: 1 }}>
             <RangeSlider
-              value={clock.pos}
+              value={pos}
               min={0}
-              max={song.durationSec}
-              step={0.5}
+              max={duration}
+              step={0.1}
               accent={colors.coral}
-              onChange={clock.seek}
+              onChange={seek}
               trackHeight={4}
               thumbSize={12}
             />
           </View>
           <Text style={styles.transportTime}>
-            {formatTime(clock.pos)} / {formatTime(song.durationSec)}
+            {formatTime(pos)} / {formatTime(duration)}
           </Text>
         </View>
+
+        <Text style={styles.engineNote}>
+          {ready
+            ? hasVideo
+              ? '녹화된 내 영상 + 실제 보컬 트랙을 재생 중이에요 · 슬라이더를 움직이면 소리가 바로 바뀝니다'
+              : 'MR 신스와 실제 믹스 그래프로 미리듣기 중이에요 · 슬라이더가 즉시 반영됩니다'
+            : '오디오 그래프를 준비하고 있어요…'}
+        </Text>
 
         {/* mix balance */}
         <Card style={{ marginTop: space(4) }}>
@@ -258,7 +483,13 @@ export function ResultScreen({ songId }: { songId: string }) {
         <View style={{ marginTop: space(5) }}>
           <View style={styles.cardHead}>
             <Text style={styles.sectionTitle}>오디오 편집</Text>
-            <Pressable onPress={() => { setSettings(DEFAULT_SETTINGS); setPreset(null); }}>
+            <Pressable
+              onPress={() => {
+                setSettings(DEFAULT_SETTINGS);
+                mixerRef.current?.setSettings(DEFAULT_SETTINGS);
+                setPreset(null);
+              }}
+            >
               <Text style={styles.resetLink}>초기화</Text>
             </Pressable>
           </View>
@@ -270,11 +501,7 @@ export function ResultScreen({ songId }: { songId: string }) {
                 label={item.label}
                 compact
                 active={preset === item.key}
-                onPress={() => {
-                  setSettings(item.values);
-                  setPreset(item.key);
-                  showToast(`${item.label} 프리셋을 적용했어요`);
-                }}
+                onPress={() => applyPreset(item)}
               />
             ))}
           </ScrollView>
@@ -335,7 +562,7 @@ export function ResultScreen({ songId }: { songId: string }) {
             />
             <View style={styles.syncHint}>
               <Text style={styles.syncHintText}>
-                영상이 음원보다 늦으면 +, 빠르면 −로 조정하세요 · 10ms 단위
+                +면 음원이 영상보다 늦게, −면 앞서 재생됩니다 · 자막과 최종 영상에도 10ms 단위로 반영
               </Text>
             </View>
           </Card>
@@ -349,10 +576,10 @@ export function ResultScreen({ songId }: { songId: string }) {
           </View>
           <View style={styles.specGrid}>
             {[
-              { label: '해상도', value: '1080 × 1920' },
+              { label: '해상도', value: '720 × 1280' },
               { label: '프레임', value: '30fps' },
-              { label: '길이', value: formatTime(take?.durationSec ?? song.durationSec) },
-              { label: '용량', value: '약 24.6MB' },
+              { label: '길이', value: formatTime(duration) },
+              { label: '용량', value: specSize },
             ].map(item => (
               <View key={item.label} style={styles.specCell}>
                 <Text style={styles.specLabel}>{item.label}</Text>
@@ -373,78 +600,74 @@ export function ResultScreen({ songId }: { songId: string }) {
           style={{ flex: 0.8 }}
         />
         <PrimaryButton
-          label={generated ? '저장 · 공유하기' : '최종 영상 생성'}
-          onPress={generated ? () => setModalOpen(true) : startGeneration}
+          label={exported ? '저장 · 공유하기' : generating ? '생성 중…' : '최종 영상 생성'}
+          onPress={() => {
+            if (exported) setModalOpen(true);
+            else void startGeneration();
+          }}
           style={{ flex: 1.4 }}
         />
       </View>
 
       {/* generation modal */}
-      <Modal visible={modalOpen} transparent animationType="fade" onRequestClose={() => setModalOpen(false)}>
+      <Modal visible={modalOpen} transparent animationType="fade" onRequestClose={closeModal}>
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
-            <Pressable
-              onPress={() => setModalOpen(false)}
-              accessibilityLabel="닫기"
-              style={styles.modalClose}
-              hitSlop={10}
-            >
+            <Pressable onPress={closeModal} accessibilityLabel="닫기" style={styles.modalClose} hitSlop={10}>
               <CloseIcon size={12} color={colors.textDim} />
             </Pressable>
 
-            {!generated ? (
+            {generating ? (
               <>
                 <View style={styles.modalIcon}>
                   <ActivityIndicator color={colors.coral} />
                 </View>
                 <Text style={styles.modalTitle}>커버 영상을 만들고 있어요</Text>
                 <Text style={styles.modalCaption}>
-                  {STEPS[stepIndex]} · {Math.round(progress)}%
+                  실제 캔버스·오디오 합성 중 · {Math.floor(elapsed)}초 / {Math.round(duration)}초 ·{' '}
+                  {Math.round(progress)}%
                 </Text>
                 <View style={styles.modalTrack}>
-                  <View style={[styles.modalFill, { width: `${progress}%` }]} />
+                  <View style={[styles.modalFill, { width: `${Math.max(2, progress)}%` }]} />
                 </View>
                 <View style={styles.modalSteps}>
-                  {STEPS.map((label, index) => (
-                    <View key={label} style={styles.modalStepRow}>
-                      <View
-                        style={[
-                          styles.modalStepDot,
-                          index < stepIndex && { backgroundColor: colors.mint },
-                          index === stepIndex && { backgroundColor: colors.coral },
-                        ]}
-                      />
-                      <Text
-                        style={[
-                          styles.modalStepText,
-                          index <= stepIndex && { color: colors.textDim },
-                        ]}
-                      >
-                        {label}
-                      </Text>
-                    </View>
-                  ))}
+                  {['오디오 믹스 (보컬+Echo+Reverb+MR)', '영상 프레임 캔버스 합성', '싱크 가사 자막 렌더', '파일 인코딩'].map(
+                    (label, index) => {
+                      const stepIndex = Math.min(3, Math.floor((progress / 100) * 4));
+                      return (
+                        <View key={label} style={styles.modalStepRow}>
+                          <View
+                            style={[
+                              styles.modalStepDot,
+                              index < stepIndex && { backgroundColor: colors.mint },
+                              index === stepIndex && { backgroundColor: colors.coral },
+                            ]}
+                          />
+                          <Text style={[styles.modalStepText, index <= stepIndex && { color: colors.textDim }]}>
+                            {label}
+                          </Text>
+                        </View>
+                      );
+                    },
+                  )}
                 </View>
+                <GhostButton label="생성 취소" onPress={closeModal} style={{ marginTop: space(4), width: '100%' }} />
+                <Text style={styles.modalFootnote}>실제 녹화 길이만큼 실시간으로 합성합니다</Text>
               </>
-            ) : (
+            ) : exported ? (
               <>
                 <View style={[styles.modalIcon, { backgroundColor: colors.mintSoft, borderColor: 'rgba(46,230,168,0.4)' }]}>
                   <CheckIcon size={20} color={colors.mint} />
                 </View>
-                <Text style={styles.modalTitle}>커버 영상이 완성됐어요</Text>
-                <Text style={styles.modalCaption}>1080×1920 · 9:16 · {formatTime(take?.durationSec ?? song.durationSec)} · 24.6MB</Text>
+                <Text style={styles.modalTitle}>커버 영상 파일이 완성됐어요</Text>
+                <Text style={styles.modalCaption}>
+                  {exported.width}×{exported.height} · 9:16 · {formatTime(duration)} ·{' '}
+                  {(exported.size / (1024 * 1024)).toFixed(1)}MB · {exported.extension.toUpperCase()}
+                </Text>
 
                 <View style={styles.shareGrid}>
-                  <PrimaryButton
-                    label="기기에 저장"
-                    onPress={() => showToast('갤러리에 저장했어요 (데모)')}
-                    style={{ flex: 1 }}
-                  />
-                  <GhostButton
-                    label="링크 복사"
-                    onPress={() => showToast('공유 링크를 복사했어요 (데모)')}
-                    style={{ flex: 1 }}
-                  />
+                  <PrimaryButton label="기기에 저장" onPress={saveToDevice} style={{ flex: 1 }} />
+                  <GhostButton label="공유하기" onPress={() => void shareOut()} style={{ flex: 1 }} />
                 </View>
 
                 <Text style={styles.shareTitle}>SNS 공유</Text>
@@ -455,7 +678,7 @@ export function ResultScreen({ songId }: { songId: string }) {
                   ].map(item => (
                     <Pressable
                       key={item.label}
-                      onPress={() => showToast(`${item.label} 업로드 화면으로 이동할게요 (데모)`)}
+                      onPress={() => void shareOut()}
                       style={({ pressed }) => [styles.snsButton, pressed && { opacity: 0.8 }]}
                     >
                       <View style={[styles.snsDot, { backgroundColor: item.tone }]} />
@@ -464,8 +687,32 @@ export function ResultScreen({ songId }: { songId: string }) {
                   ))}
                 </View>
                 <Text style={styles.modalFootnote}>
-                  실제 업로드는 계정 연동 후 지원될 예정이에요
+                  공유 시트에서 앱을 고르면 실제 영상 파일이 첨부됩니다 · 미지원 브라우저는 다운로드
                 </Text>
+                <GhostButton
+                  label="다시 생성"
+                  onPress={() => {
+                    setModalOpen(false);
+                    void startGeneration();
+                  }}
+                  style={{ marginTop: space(3), width: '100%' }}
+                />
+              </>
+            ) : (
+              <>
+                <View style={styles.modalIcon}>
+                  <CheckIcon size={20} color={colors.coral} />
+                </View>
+                <Text style={styles.modalTitle}>최종 영상이 아직 없어요</Text>
+                <Text style={styles.modalCaption}>최종 영상 생성을 눌러 실제 파일을 만들어 주세요</Text>
+                <PrimaryButton
+                  label="최종 영상 생성"
+                  onPress={() => {
+                    setModalOpen(false);
+                    void startGeneration();
+                  }}
+                  style={{ marginTop: space(4), width: '100%' }}
+                />
               </>
             )}
           </View>
@@ -614,7 +861,7 @@ const styles = StyleSheet.create({
     marginTop: 10,
     overflow: 'hidden',
   },
-  subtitleBarFill: { width: '62%', height: 2, borderRadius: 2, backgroundColor: colors.coral },
+  subtitleBarFill: { height: 2, borderRadius: 2, backgroundColor: colors.coral },
   previewBottom: { position: 'absolute', left: 12, right: 12, bottom: 18, gap: 8 },
   previewSongRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   previewSongTitle: { ...type.micro, color: colors.text, fontSize: 10 },
@@ -637,6 +884,15 @@ const styles = StyleSheet.create({
   previewSideDivider: { height: 1, backgroundColor: colors.border, marginVertical: 3 },
   transport: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: space(3) },
   transportTime: { ...type.micro, color: colors.textFaint, fontSize: 9.5, width: 62, textAlign: 'right' },
+  engineNote: {
+    ...type.micro,
+    color: colors.textFaint,
+    fontSize: 9.5,
+    lineHeight: 14,
+    marginTop: space(2),
+    textAlign: 'center',
+    fontWeight: '500',
+  },
   cardHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: space(2) },
   cardTitle: { ...type.label, color: colors.text, fontSize: 13 },
   sectionTitle: { ...type.section, color: colors.text, marginBottom: space(2) },
@@ -747,5 +1003,5 @@ const styles = StyleSheet.create({
   },
   snsDot: { width: 6, height: 6, borderRadius: 3 },
   snsLabel: { ...type.micro, color: colors.text, fontSize: 10 },
-  modalFootnote: { ...type.micro, color: colors.textFaint, marginTop: space(3), fontSize: 9, textAlign: 'center', fontWeight: '500' },
+  modalFootnote: { ...type.micro, color: colors.textFaint, marginTop: space(3), fontSize: 9, textAlign: 'center', fontWeight: '500', lineHeight: 13 },
 });
