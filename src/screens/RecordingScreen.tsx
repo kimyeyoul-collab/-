@@ -94,7 +94,18 @@ export function RecordingScreen({ songId }: { songId: string }) {
     mrRef.current = null;
   }, []);
 
-  useEffect(() => () => stopMr(), [stopMr]);
+  useEffect(
+    () => () => {
+      stopMr();
+      try {
+        mrBusRef.current?.disconnect();
+      } catch {
+        // ignore
+      }
+      mrBusRef.current = null;
+    },
+    [stopMr],
+  );
 
   useEffect(
     () => () => {

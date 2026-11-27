@@ -91,7 +91,7 @@ export interface TakeResult {
   audioMime?: string;
   hasVideo?: boolean;
   /** how the take was captured */
-  captureMode?: 'dual' | 'single' | 'audio-only' | 'none';
+  captureMode?: 'dual' | 'single' | 'video-only' | 'audio-only' | 'none';
 }
 
 export const DEFAULT_SETTINGS: TakeSettings = {

@@ -404,6 +404,8 @@ export function ResultScreen({ songId }: { songId: string }) {
                 ? 'CAM+MIC'
                 : take?.captureMode === 'single'
                 ? '통합 녹화'
+                : take?.captureMode === 'video-only'
+                ? '영상만'
                 : take?.captureMode === 'audio-only'
                 ? '오디오만'
                 : '모의'}

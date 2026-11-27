@@ -18,7 +18,7 @@ export interface AudioVideoBlob {
 }
 
 export interface TakeRecording {
-  mode: 'dual' | 'single' | 'audio-only' | 'none';
+  mode: 'dual' | 'single' | 'video-only' | 'audio-only' | 'none';
   video: AudioVideoBlob | null;
   vocal: AudioVideoBlob | null;
   combined: AudioVideoBlob | null;
@@ -179,6 +179,9 @@ export function startTakeRecording(stream: any): TakeRecorder {
       combinedPart = makePart(stream, pickVideoMime() || pickAudioMime(), true);
       if (combinedPart) mode = 'single';
     }
+  } else if (stream && videoTracks.length > 0) {
+    videoPart = makePart(new win.MediaStream(videoTracks), pickVideoMime(), true);
+    if (videoPart) mode = 'video-only';
   } else if (stream && audioTracks.length > 0) {
     audioPart = makePart(new win.MediaStream(audioTracks), pickAudioMime(), false);
     if (audioPart) mode = 'audio-only';
@@ -225,6 +228,10 @@ export function startTakeRecording(stream: any): TakeRecorder {
     if (mode === 'dual') {
       const [video, vocal] = await Promise.all([stopPart(videoPart), stopPart(audioPart)]);
       return { mode, video, vocal, combined: null, durationSec: duration };
+    }
+    if (mode === 'video-only') {
+      const video = await stopPart(videoPart);
+      return { mode, video, vocal: null, combined: null, durationSec: duration };
     }
     if (mode === 'single' || mode === 'audio-only') {
       const combined = await stopPart(combinedPart ?? audioPart);
