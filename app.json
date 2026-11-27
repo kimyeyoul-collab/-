@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Karaoke Cover Studio",
+    "slug": "karaoke-cover-studio",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "karaokecover",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#080B10",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#080B10"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.karaoke.coverstudio",
+      "infoPlist": {
+        "NSCameraUsageDescription": "커버 영상 촬영을 위해 전면 카메라를 사용합니다.",
+        "NSMicrophoneUsageDescription": "커버 녹음을 위해 마이크를 사용합니다."
+      }
+    },
+    "android": {
+      "package": "com.karaoke.coverstudio",
+      "adaptiveIcon": {
+        "backgroundColor": "#080B10",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "permissions": ["CAMERA", "RECORD_AUDIO"],
+      "predictiveBackGestureEnabled": false
+    },
+    "experiments": {
+      "baseUrl": "/karaoke-app"
+    },
+    "web": {
+      "bundler": "metro",
+      "favicon": "./assets/favicon.png",
+      "name": "Karaoke Cover Studio",
+      "shortName": "Karaoke",
+      "themeColor": "#080B10",
+      "backgroundColor": "#080B10"
+    }
+  }
+}
